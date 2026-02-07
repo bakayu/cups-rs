@@ -30,9 +30,9 @@
 //! }
 //! ```
 
-use crate::bindings;
 use crate::connection::HttpConnection;
 use crate::error::{Error, Result};
+use crate::{bindings, config};
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::ptr;
@@ -83,6 +83,7 @@ pub enum IppValueTag {
     Charset,
     Language,
     MimeType,
+    DeleteAttr,
 }
 
 impl From<IppValueTag> for bindings::ipp_tag_t {
@@ -99,6 +100,7 @@ impl From<IppValueTag> for bindings::ipp_tag_t {
             IppValueTag::Charset => bindings::ipp_tag_e_IPP_TAG_CHARSET,
             IppValueTag::Language => bindings::ipp_tag_e_IPP_TAG_LANGUAGE,
             IppValueTag::MimeType => bindings::ipp_tag_e_IPP_TAG_MIMETYPE,
+            IppValueTag::DeleteAttr => bindings::ipp_tag_e_IPP_TAG_DELETEATTR,
         }
     }
 }
@@ -169,24 +171,18 @@ impl IppStatus {
             bindings::ipp_status_e_IPP_STATUS_OK_IGNORED_OR_SUBSTITUTED => {
                 IppStatus::OkIgnoredOrSubstituted
             }
-            bindings::ipp_status_e_IPP_STATUS_OK_CONFLICTING => {
-                IppStatus::OkConflicting
-            }
+            bindings::ipp_status_e_IPP_STATUS_OK_CONFLICTING => IppStatus::OkConflicting,
             bindings::ipp_status_e_IPP_STATUS_ERROR_BAD_REQUEST => IppStatus::ErrorBadRequest,
             bindings::ipp_status_e_IPP_STATUS_ERROR_FORBIDDEN => IppStatus::ErrorForbidden,
             bindings::ipp_status_e_IPP_STATUS_ERROR_NOT_AUTHENTICATED => {
                 IppStatus::ErrorNotAuthenticated
             }
-            bindings::ipp_status_e_IPP_STATUS_ERROR_NOT_AUTHORIZED => {
-                IppStatus::ErrorNotAuthorized
-            }
+            bindings::ipp_status_e_IPP_STATUS_ERROR_NOT_AUTHORIZED => IppStatus::ErrorNotAuthorized,
             bindings::ipp_status_e_IPP_STATUS_ERROR_NOT_POSSIBLE => IppStatus::ErrorNotPossible,
             bindings::ipp_status_e_IPP_STATUS_ERROR_TIMEOUT => IppStatus::ErrorTimeout,
             bindings::ipp_status_e_IPP_STATUS_ERROR_NOT_FOUND => IppStatus::ErrorNotFound,
             bindings::ipp_status_e_IPP_STATUS_ERROR_GONE => IppStatus::ErrorGone,
-            bindings::ipp_status_e_IPP_STATUS_ERROR_REQUEST_ENTITY => {
-                IppStatus::ErrorRequestEntity
-            }
+            bindings::ipp_status_e_IPP_STATUS_ERROR_REQUEST_ENTITY => IppStatus::ErrorRequestEntity,
             bindings::ipp_status_e_IPP_STATUS_ERROR_REQUEST_VALUE => IppStatus::ErrorRequestValue,
             bindings::ipp_status_e_IPP_STATUS_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED => {
                 IppStatus::ErrorDocumentFormatNotSupported
@@ -235,6 +231,23 @@ impl IppRequest {
     /// Create a new IPP request
     pub fn new(operation: IppOperation) -> Result<Self> {
         let ipp = unsafe { bindings::ippNewRequest(operation.into()) };
+
+        if ipp.is_null() {
+            return Err(Error::UnsupportedFeature(
+                "Failed to create IPP request".to_string(),
+            ));
+        }
+
+        Ok(IppRequest {
+            ipp,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Create a new IPP request from a raw operation code.
+    /// This is useful for deprecated operations.
+    pub fn new_raw(op_code: i32) -> Result<Self> {
+        let ipp = unsafe { bindings::ippNewRequest(op_code) };
 
         if ipp.is_null() {
             return Err(Error::UnsupportedFeature(
@@ -320,7 +333,12 @@ impl IppRequest {
         let name_c = CString::new(name)?;
 
         let attr = unsafe {
-            bindings::ippAddBoolean(self.ipp, group.into(), name_c.as_ptr(), value as ::std::os::raw::c_char)
+            bindings::ippAddBoolean(
+                self.ipp,
+                group.into(),
+                name_c.as_ptr(),
+                value as ::std::os::raw::c_char,
+            )
         };
 
         if attr.is_null() {
@@ -347,7 +365,8 @@ impl IppRequest {
             .map(|v| CString::new(*v).map_err(Error::from))
             .collect::<Result<Vec<_>>>()?;
 
-        let values_ptrs: Vec<*const ::std::os::raw::c_char> = values_c.iter().map(|s| s.as_ptr()).collect();
+        let values_ptrs: Vec<*const ::std::os::raw::c_char> =
+            values_c.iter().map(|s| s.as_ptr()).collect();
 
         let attr = unsafe {
             bindings::ippAddStrings(
@@ -369,6 +388,35 @@ impl IppRequest {
         } else {
             Ok(())
         }
+    }
+
+    /// Add standard IPP operation attributes:
+    /// - attributes-charset = "utf-8"
+    /// - attributes-natural-language = "en"
+    /// - requesting-user-name = $USER (or "unknown")
+    pub fn add_standard_attrs(&mut self) -> Result<()> {
+        let user = config::get_user();
+
+        self.add_string(
+            IppTag::Operation,
+            IppValueTag::Charset,
+            "attributes-charset",
+            "utf-8",
+        )?;
+        self.add_string(
+            IppTag::Operation,
+            IppValueTag::Language,
+            "attributes-natural-language",
+            "en",
+        )?;
+        self.add_string(
+            IppTag::Operation,
+            IppValueTag::Name,
+            "requesting-user-name",
+            &user,
+        )?;
+
+        Ok(())
     }
 
     /// Send this request and receive a response
@@ -464,11 +512,11 @@ impl IppResponse {
             Err(_) => return None,
         };
 
-        let group_tag = group.map(|g| g.into()).unwrap_or(bindings::ipp_tag_e_IPP_TAG_ZERO);
+        let group_tag = group
+            .map(|g| g.into())
+            .unwrap_or(bindings::ipp_tag_e_IPP_TAG_ZERO);
 
-        let attr = unsafe {
-            bindings::ippFindAttribute(self.ipp, name_c.as_ptr(), group_tag)
-        };
+        let attr = unsafe { bindings::ippFindAttribute(self.ipp, name_c.as_ptr(), group_tag) };
 
         if attr.is_null() {
             None
@@ -563,6 +611,12 @@ mod tests {
     }
 
     #[test]
+    fn test_ipp_request_creation_from_raw() {
+        let request = IppRequest::new_raw(bindings::ipp_op_e_IPP_OP_CUPS_SET_DEFAULT);
+        assert!(request.is_ok());
+    }
+
+    #[test]
     fn test_ipp_add_string() {
         let mut request = IppRequest::new(IppOperation::GetPrinterAttributes).unwrap();
         let result = request.add_string(
@@ -585,6 +639,13 @@ mod tests {
     fn test_ipp_add_boolean() {
         let mut request = IppRequest::new(IppOperation::GetJobs).unwrap();
         let result = request.add_boolean(IppTag::Operation, "my-jobs", true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_add_standard_attrs() {
+        let mut request = IppRequest::new(IppOperation::GetJobs).unwrap();
+        let result = request.add_standard_attrs();
         assert!(result.is_ok());
     }
 
